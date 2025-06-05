@@ -426,10 +426,11 @@ func (e *blockComputer) executeBlock(
 		requestQueue,
 		systemLogger,
 	)
-	close(requestQueue)
 	if err != nil {
 		return nil, err
 	}
+
+	close(requestQueue)
 
 	wg := &sync.WaitGroup{}
 	wg.Add(e.maxConcurrency)
