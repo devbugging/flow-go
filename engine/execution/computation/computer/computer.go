@@ -109,6 +109,7 @@ type blockComputer struct {
 	tracer                module.Tracer
 	log                   zerolog.Logger
 	systemChunkCtx        fvm.Context
+	systemTxn             *flow.TransactionBody
 	committer             ViewCommitter
 	executionDataProvider provider.Provider
 	signer                module.Local
@@ -165,6 +166,12 @@ func NewBlockComputer(
 		vmCtx,
 		fvm.WithMetricsReporter(metrics),
 		fvm.WithTracer(tracer))
+
+	systemTxn, err := blueprints.SystemChunkTransaction(vmCtx.Chain)
+	if err != nil {
+		return nil, fmt.Errorf("could not build system chunk transaction: %w", err)
+	}
+
 	return &blockComputer{
 		vm:                    vm,
 		vmCtx:                 vmCtx,
@@ -172,6 +179,7 @@ func NewBlockComputer(
 		tracer:                tracer,
 		log:                   logger,
 		systemChunkCtx:        systemChunkCtx,
+		systemTxn:             systemTxn,
 		committer:             committer,
 		executionDataProvider: executionDataProvider,
 		signer:                signer,
@@ -207,12 +215,21 @@ func (e *blockComputer) ExecuteBlock(
 	return results, nil
 }
 
+func (e *blockComputer) userTransactionsCount(collections []*entity.CompleteCollection) int {
+	count := 0
+	for _, collection := range collections {
+		count += len(collection.Transactions)
+	}
+
+	return count
+}
+
 func (e *blockComputer) queueUserTransactions(
 	blockId flow.Identifier,
 	blockHeader *flow.Header,
 	rawCollections []*entity.CompleteCollection,
 	requestQueue chan TransactionRequest,
-) uint32 {
+) {
 	txnIndex := uint32(0)
 	blockIdStr := blockId.String()
 
@@ -250,28 +267,17 @@ func (e *blockComputer) queueUserTransactions(
 			txnIndex += 1
 		}
 	}
-
-	return txnIndex
 }
 
 func (e *blockComputer) queueSystemTransaction(
 	systemCtx fvm.Context,
 	systemCollectionInfo collectionInfo,
-	processCallbackEvents flow.EventsList,
+	systemTxn *flow.TransactionBody,
+	executeCallbackTxs []*flow.TransactionBody,
 	requestQueue chan TransactionRequest,
-	systemLogger zerolog.Logger,
 	txnIndex uint32,
-) error {
-	systemTxn, err := blueprints.SystemChunkTransaction(e.vmCtx.Chain)
-	if err != nil {
-		return fmt.Errorf("could not get system chunk transaction: %w", err)
-	}
-
-	executeCallbackTxs, err := blueprints.ExecuteCallbacksTransactions(e.vmCtx.Chain, processCallbackEvents)
-	if err != nil {
-		return fmt.Errorf("could not execute callback transactions: %w", err)
-	}
-
+	systemLogger zerolog.Logger,
+) {
 	allTxs := append(executeCallbackTxs, systemTxn)
 	systemCollectionInfo.CompleteCollection.Transactions = allTxs
 	systemLogger = systemLogger.With().Uint32("num_txs", uint32(len(allTxs))).Logger()
@@ -290,8 +296,6 @@ func (e *blockComputer) queueSystemTransaction(
 
 		txnIndex++
 	}
-
-	return nil
 }
 
 // selectChunkConstructorForProtocolVersion selects a [flow.Chunk] constructor to
@@ -329,47 +333,19 @@ func (e *blockComputer) executeBlock(
 		return nil, fmt.Errorf("executable block start state is not set")
 	}
 
-	blockId := block.ID()
-	blockIdStr := blockId.String()
-
 	rawCollections := block.Collections()
 
 	blockSpan := e.tracer.StartSpanFromParent(
-		e.tracer.BlockRootSpan(blockId),
+		e.tracer.BlockRootSpan(block.ID()),
 		trace.EXEComputeBlock)
 	blockSpan.SetAttributes(
-		attribute.String("block_id", blockIdStr),
+		attribute.String("block_id", block.ID().String()),
 		attribute.Int("collection_counts", len(rawCollections)))
 	defer blockSpan.End()
 
-	systemCtx := fvm.NewContextFromParent(
-		e.systemChunkCtx,
-		fvm.WithBlockHeader(block.Block.Header),
-		fvm.WithProtocolStateSnapshot(e.protocolState.AtBlockID(blockId)),
-	)
-
-	systemLogger := systemCtx.Logger.With().
-		Str("block_id", blockId.String()).
-		Uint64("height", block.Block.Header.Height).
-		Bool("system_chunk", true).
-		Bool("system_transaction", true).
-		Int("num_collections", len(rawCollections)).
-		Logger()
-
-	systemCollectionInfo := collectionInfo{
-		blockId:         blockId,
-		blockIdStr:      blockId.String(),
-		blockHeight:     block.Block.Header.Height,
-		collectionIndex: len(rawCollections),
-		CompleteCollection: &entity.CompleteCollection{
-			Transactions: []*flow.TransactionBody{},
-		},
-		isSystemTransaction: true,
-	}
-
 	// We temporarily support chunk models associated with both protocol versions 1 and 2.
 	// TODO(mainnet27, #6773): remove this https://github.com/onflow/flow-go/issues/6773
-	versionedChunkConstructor, err := e.selectChunkConstructorForProtocolVersion(blockId)
+	versionedChunkConstructor, err := e.selectChunkConstructorForProtocolVersion(block.ID())
 	if err != nil {
 		return nil, fmt.Errorf("could not select chunk constructor for current protocol version: %w", err)
 	}
@@ -392,63 +368,28 @@ func (e *blockComputer) executeBlock(
 	)
 	defer collector.Stop()
 
-	requestQueue := make(chan TransactionRequest)
-
 	database := newTransactionCoordinator(
 		e.vm,
 		baseSnapshot,
 		derivedBlockData,
 		collector)
 
-	nextTxnIndex := e.queueUserTransactions(
-		blockId,
-		block.Block.Header,
+	e.executeUserTransactions(
+		block,
+		blockSpan,
+		database,
 		rawCollections,
-		requestQueue,
 	)
 
-	var processEvents flow.EventsList
-
-	if e.vmCtx.ScheduleCallbacksEnabled {
-		processEvents, nextTxnIndex, err = e.executeProcessCallback(
-			systemCtx,
-			systemCollectionInfo,
-			database,
-			blockSpan,
-			systemLogger,
-			nextTxnIndex,
-		)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	err = e.queueSystemTransaction(
-		systemCtx,
-		systemCollectionInfo,
-		processEvents,
-		requestQueue,
-		systemLogger,
-		nextTxnIndex,
+	err = e.executeSystemTransactions(
+		block,
+		blockSpan,
+		database,
+		rawCollections,
 	)
 	if err != nil {
 		return nil, err
 	}
-
-	close(requestQueue)
-
-	wg := &sync.WaitGroup{}
-	wg.Add(e.maxConcurrency)
-
-	for i := 0; i < e.maxConcurrency; i++ {
-		go e.executeTransactions(
-			blockSpan,
-			database,
-			requestQueue,
-			wg)
-	}
-
-	wg.Wait()
 
 	err = database.Error()
 	if err != nil {
@@ -467,6 +408,133 @@ func (e *blockComputer) executeBlock(
 	e.metrics.ExecutionBlockCachedPrograms(derivedBlockData.CachedPrograms())
 
 	return res, nil
+}
+
+// executeUserTransactions executes the user transactions in the block.
+// It queues the user transactions into a request queue and then executes them in parallel.
+func (e *blockComputer) executeUserTransactions(
+	block *entity.ExecutableBlock,
+	blockSpan otelTrace.Span,
+	database *transactionCoordinator,
+	rawCollections []*entity.CompleteCollection,
+) {
+	txCount := e.userTransactionsCount(rawCollections)
+	txQueue := make(chan TransactionRequest, txCount)
+
+	e.queueUserTransactions(
+		block.ID(),
+		block.Block.Header,
+		rawCollections,
+		txQueue,
+	)
+
+	close(txQueue)
+
+	e.executeQueue(blockSpan, database, txQueue)
+}
+
+// executeSystemTransactions executes all system transactions in the block as part of the system collection.
+//
+// System transactions are executed in the following order:
+// 1. system transaction that processes the scheduled callbacks which is a blocking transaction and
+// the result is used for the next system transaction
+// 2. system transactions that each execute a single scheduled callback by the ID obtained from events
+// of the previous system transaction
+// 3. system transaction that executes the system chunk
+//
+// An error can be returned if the process callback transaction fails. This is a fatal error.
+func (e *blockComputer) executeSystemTransactions(
+	block *entity.ExecutableBlock,
+	blockSpan otelTrace.Span,
+	database *transactionCoordinator,
+	rawCollections []*entity.CompleteCollection,
+) error {
+	userTxCount := e.userTransactionsCount(rawCollections)
+	userCollectionCount := len(rawCollections)
+	txIndex := uint32(userTxCount) // we equal to tx count since the index is 0-based
+
+	systemCtx := fvm.NewContextFromParent(
+		e.systemChunkCtx,
+		fvm.WithBlockHeader(block.Block.Header),
+		fvm.WithProtocolStateSnapshot(e.protocolState.AtBlockID(block.ID())),
+	)
+
+	systemLogger := systemCtx.Logger.With().
+		Str("block_id", block.ID().String()).
+		Uint64("height", block.Block.Header.Height).
+		Bool("system_chunk", true).
+		Bool("system_transaction", true).
+		Int("num_collections", userCollectionCount).
+		Logger()
+
+	systemCollectionInfo := collectionInfo{
+		blockId:         block.ID(),
+		blockIdStr:      block.ID().String(),
+		blockHeight:     block.Block.Header.Height,
+		collectionIndex: len(rawCollections),
+		CompleteCollection: &entity.CompleteCollection{
+			Transactions: []*flow.TransactionBody{},
+		},
+		isSystemTransaction: true,
+	}
+
+	var callbackTxs []*flow.TransactionBody
+	var err error
+
+	if e.vmCtx.ScheduleCallbacksEnabled {
+		callbackTxs, err = e.executeProcessCallback(
+			e.systemChunkCtx,
+			systemCollectionInfo,
+			database,
+			blockSpan,
+			txIndex,
+			systemLogger,
+		)
+		if err != nil {
+			return err
+		}
+
+		txIndex++
+	}
+
+	const systemTxCount = 1 // we always have one system transaction
+	txQueue := make(chan TransactionRequest, len(callbackTxs)+systemTxCount)
+
+	e.queueSystemTransaction(
+		systemCtx,
+		systemCollectionInfo,
+		e.systemTxn,
+		callbackTxs,
+		txQueue,
+		txIndex,
+		systemLogger,
+	)
+
+	close(txQueue)
+
+	e.executeQueue(blockSpan, database, txQueue)
+
+	return nil
+}
+
+// executeQueue executes the transactions in the request queue in parallel with the maxConcurrency workers.
+func (e *blockComputer) executeQueue(
+	blockSpan otelTrace.Span,
+	database *transactionCoordinator,
+	txQueue chan TransactionRequest,
+) {
+	wg := &sync.WaitGroup{}
+	wg.Add(e.maxConcurrency)
+
+	for range e.maxConcurrency {
+		go e.executeTransactions(
+			blockSpan,
+			database,
+			txQueue,
+			wg)
+	}
+
+	wg.Wait()
 }
 
 func (e *blockComputer) executeTransactions(
@@ -617,9 +685,9 @@ func (e *blockComputer) executeProcessCallback(
 	systemCollectionInfo collectionInfo,
 	database *transactionCoordinator,
 	blockSpan otelTrace.Span,
-	systemLogger zerolog.Logger,
 	txnIndex uint32,
-) (flow.EventsList, uint32, error) {
+	systemLogger zerolog.Logger,
+) ([]*flow.TransactionBody, error) {
 	processTxn := blueprints.ProcessCallbacksTransaction(e.vmCtx.Chain)
 
 	request := newTransactionRequest(
@@ -637,7 +705,7 @@ func (e *blockComputer) executeProcessCallback(
 			snapshotTime = txn.SnapshotTime()
 		}
 
-		return nil, 0, fmt.Errorf(
+		return nil, fmt.Errorf(
 			"failed to execute %s transaction %v (%d@%d) for block %s at height %v: %w",
 			"system",
 			request.txnIdStr,
@@ -649,11 +717,11 @@ func (e *blockComputer) executeProcessCallback(
 	}
 
 	if txn.Output().Err != nil {
-		return nil, 0, fmt.Errorf(
+		return nil, fmt.Errorf(
 			"process callback transaction %s error: %v",
 			request.txnIdStr,
 			txn.Output().Err)
 	}
 
-	return txn.Output().Events, txnIndex + 1, nil
+	return blueprints.ExecuteCallbacksTransactions(e.vmCtx.Chain, txn.Output().Events)
 }
