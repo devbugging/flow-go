@@ -1,7 +1,7 @@
-import "UnsafeCallbackScheduler"
+import "CallbackScheduler"
 
 transaction(callbackID: UInt64) {
     execute {
-        UnsafeCallbackScheduler.executeCallback(ID: callbackID)
+        CallbackScheduler.executeCallback(ID: callbackID)
     }
 }
