@@ -93,13 +93,13 @@ func TestExecuteCallbacksTransactions(t *testing.T) {
 			for i, tx := range txs {
 				assert.NotNil(t, tx)
 				assert.NotEmpty(t, tx.Script)
-				assert.Equal(t, uint64(blueprints.SystemChunkTransactionGasLimit), tx.GasLimit)
-				assert.Len(t, tx.Arguments, 2)
+				expectedEffort := uint64(100 * (i + 1)) // Events created with efforts 100, 200, 300
+				assert.Equal(t, expectedEffort, tx.GasLimit)
+				assert.Len(t, tx.Arguments, 1)
 				assert.NotEmpty(t, tx.Arguments[0])
-				assert.NotEmpty(t, tx.Arguments[1])
 
-				t.Logf("Transaction %d: ID arg length: %d, effort arg length: %d",
-					i, len(tx.Arguments[0]), len(tx.Arguments[1]))
+				t.Logf("Transaction %d: ID arg length: %d, GasLimit: %d",
+					i, len(tx.Arguments[0]), tx.GasLimit)
 			}
 		})
 	}
@@ -121,10 +121,14 @@ func TestExecuteCallbackTransaction(t *testing.T) {
 	tx := txs[0]
 	assert.NotNil(t, tx)
 	assert.NotEmpty(t, tx.Script)
-	assert.Equal(t, uint64(blueprints.SystemChunkTransactionGasLimit), tx.GasLimit)
-	assert.Len(t, tx.Arguments, 2)
-	assert.Equal(t, tx.Arguments[0], id)
-	assert.Equal(t, tx.Arguments[1], effort)
+	assert.Equal(t, uint64(effort), tx.GasLimit)
+	assert.Len(t, tx.Arguments, 1)
+
+	expectedEncodedID, err := ccf.Encode(cadence.NewUInt64(id))
+	require.NoError(t, err)
+	assert.Equal(t, tx.Arguments[0], expectedEncodedID)
+
+	assert.Equal(t, tx.GasLimit, uint64(effort))
 }
 
 func createValidCallbackEvent(t *testing.T, id uint64, effort uint64) flow.Event {

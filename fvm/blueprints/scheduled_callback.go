@@ -53,29 +53,33 @@ func ExecuteCallbacksTransactions(chainID flow.Chain, processEvents flow.EventsL
 	return txs, nil
 }
 
-func executeCallbackTransaction(chain flow.Chain, id []byte, effort []byte) *flow.TransactionBody {
+func executeCallbackTransaction(chain flow.Chain, id []byte, effort uint64) *flow.TransactionBody {
 	script := prepareScheduledContractTransaction(chain, executeCallbacksTransaction)
 	return flow.NewTransactionBody().
 		SetScript(script).
 		AddArgument(id).
-		AddArgument(effort).
-		SetComputeLimit(SystemChunkTransactionGasLimit)
+		SetComputeLimit(effort)
 }
 
-func callbackArgsFromEvent(event flow.Event) ([]byte, []byte, error) {
+// callbackArgsFromEvent decodes the event payload and returns the callback ID and effort.
+//
+// The event for processed callback event is emitted by the process callback transaction from
+// callback scheduler contract and has the following signature:
+// event CallbackProcessed(ID: UInt64, executionEffort: UInt64)
+func callbackArgsFromEvent(event flow.Event) ([]byte, uint64, error) {
 	scheduledContractAddress := "0x0000000000000000" // todo use contract addr
 	if string(event.Type) != fmt.Sprintf(processedEventTypeTemplate, scheduledContractAddress) {
-		return nil, nil, fmt.Errorf("wrong event type is passed")
+		return nil, 0, fmt.Errorf("wrong event type is passed")
 	}
 
 	eventData, err := ccf.Decode(nil, event.Payload)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to decode event: %w", err)
+		return nil, 0, fmt.Errorf("failed to decode event: %w", err)
 	}
 
 	cadenceEvent, ok := eventData.(cadence.Event)
 	if !ok {
-		return nil, nil, fmt.Errorf("event data is not a cadence event")
+		return nil, 0, fmt.Errorf("event data is not a cadence event")
 	}
 
 	idValue := cadence.SearchFieldByName(
@@ -90,25 +94,20 @@ func callbackArgsFromEvent(event flow.Event) ([]byte, []byte, error) {
 
 	id, ok := idValue.(cadence.UInt64)
 	if !ok {
-		return nil, nil, fmt.Errorf("id is not uint64")
+		return nil, 0, fmt.Errorf("id is not uint64")
 	}
 
 	effort, ok := effortValue.(cadence.UInt64)
 	if !ok {
-		return nil, nil, fmt.Errorf("effort is not uint64")
+		return nil, 0, fmt.Errorf("effort is not uint64")
 	}
 
 	encodedID, err := ccf.Encode(id)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to encode id: %w", err)
+		return nil, 0, fmt.Errorf("failed to encode id: %w", err)
 	}
 
-	encodedEffort, err := ccf.Encode(effort)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to encode effort: %w", err)
-	}
-
-	return encodedID, encodedEffort, nil
+	return encodedID, uint64(effort), nil
 }
 
 func prepareScheduledContractTransaction(_ flow.Chain, txScript string) []byte {
