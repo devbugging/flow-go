@@ -486,7 +486,7 @@ func (e *blockComputer) executeSystemTransactions(
 
 	if e.vmCtx.ScheduleCallbacksEnabled {
 		callbackTxs, err = e.executeProcessCallback(
-			e.systemChunkCtx,
+			systemCtx,
 			systemCollectionInfo,
 			database,
 			blockSpan,
@@ -560,7 +560,7 @@ func (e *blockComputer) executeProcessCallback(
 		systemLogger,
 		txnIndex,
 		processTxn,
-		true)
+		false)
 
 	txn, err := e.executeTransactionInternal(blockSpan, database, request, 0)
 	if err != nil {
