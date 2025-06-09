@@ -334,6 +334,7 @@ func (e *blockComputer) executeBlock(
 	}
 
 	rawCollections := block.Collections()
+	userTxCount := e.userTransactionsCount(rawCollections)
 
 	blockSpan := e.tracer.StartSpanFromParent(
 		e.tracer.BlockRootSpan(block.ID()),
@@ -361,7 +362,7 @@ func (e *blockComputer) executeBlock(
 		e.receiptHasher,
 		parentBlockExecutionResultID,
 		block,
-		e.maxConcurrency,
+		userTxCount,
 		e.colResCons,
 		baseSnapshot,
 		versionedChunkConstructor,
@@ -379,6 +380,7 @@ func (e *blockComputer) executeBlock(
 		blockSpan,
 		database,
 		rawCollections,
+		userTxCount,
 	)
 
 	err = e.executeSystemTransactions(
@@ -386,6 +388,7 @@ func (e *blockComputer) executeBlock(
 		blockSpan,
 		database,
 		rawCollections,
+		userTxCount,
 	)
 	if err != nil {
 		return nil, err
@@ -417,9 +420,9 @@ func (e *blockComputer) executeUserTransactions(
 	blockSpan otelTrace.Span,
 	database *transactionCoordinator,
 	rawCollections []*entity.CompleteCollection,
+	userTxCount int,
 ) {
-	txCount := e.userTransactionsCount(rawCollections)
-	txQueue := make(chan TransactionRequest, txCount)
+	txQueue := make(chan TransactionRequest, userTxCount)
 
 	e.queueUserTransactions(
 		block.ID(),
@@ -448,10 +451,10 @@ func (e *blockComputer) executeSystemTransactions(
 	blockSpan otelTrace.Span,
 	database *transactionCoordinator,
 	rawCollections []*entity.CompleteCollection,
+	userTxCount int,
 ) error {
-	userTxCount := e.userTransactionsCount(rawCollections)
 	userCollectionCount := len(rawCollections)
-	txIndex := uint32(userTxCount) // we equal to tx count since the index is 0-based
+	txIndex := uint32(userTxCount)
 
 	systemCtx := fvm.NewContextFromParent(
 		e.systemChunkCtx,
@@ -535,6 +538,56 @@ func (e *blockComputer) executeQueue(
 	}
 
 	wg.Wait()
+}
+
+// executeProcessCallback executes a transaction that calls callback scheduler contract process method.
+// The execution result contains events that are emitted for each callback which is ready for execution.
+// We use these events to prepare callback execution transactions, which are later executed as part of the system collection.
+// An error can be returned if the process callback transaction fails. This is a fatal error.
+func (e *blockComputer) executeProcessCallback(
+	systemCtx fvm.Context,
+	systemCollectionInfo collectionInfo,
+	database *transactionCoordinator,
+	blockSpan otelTrace.Span,
+	txnIndex uint32,
+	systemLogger zerolog.Logger,
+) ([]*flow.TransactionBody, error) {
+	processTxn := blueprints.ProcessCallbacksTransaction(e.vmCtx.Chain)
+
+	request := newTransactionRequest(
+		systemCollectionInfo,
+		systemCtx,
+		systemLogger,
+		txnIndex,
+		processTxn,
+		true)
+
+	txn, err := e.executeTransactionInternal(blockSpan, database, request, 0)
+	if err != nil {
+		snapshotTime := logical.Time(0)
+		if txn != nil {
+			snapshotTime = txn.SnapshotTime()
+		}
+
+		return nil, fmt.Errorf(
+			"failed to execute %s transaction %v (%d@%d) for block %s at height %v: %w",
+			"system",
+			request.txnIdStr,
+			request.txnIndex,
+			snapshotTime,
+			request.blockIdStr,
+			request.ctx.BlockHeader.Height,
+			err)
+	}
+
+	if txn.Output().Err != nil {
+		return nil, fmt.Errorf(
+			"process callback transaction %s error: %v",
+			request.txnIdStr,
+			txn.Output().Err)
+	}
+
+	return blueprints.ExecuteCallbacksTransactions(e.vmCtx.Chain, txn.Output().Events)
 }
 
 func (e *blockComputer) executeTransactions(
@@ -678,50 +731,4 @@ func (e *blockComputer) executeTransactionInternal(
 	}
 
 	return txn, txn.Commit()
-}
-
-func (e *blockComputer) executeProcessCallback(
-	systemCtx fvm.Context,
-	systemCollectionInfo collectionInfo,
-	database *transactionCoordinator,
-	blockSpan otelTrace.Span,
-	txnIndex uint32,
-	systemLogger zerolog.Logger,
-) ([]*flow.TransactionBody, error) {
-	processTxn := blueprints.ProcessCallbacksTransaction(e.vmCtx.Chain)
-
-	request := newTransactionRequest(
-		systemCollectionInfo,
-		systemCtx,
-		systemLogger,
-		txnIndex,
-		processTxn,
-		true)
-
-	txn, err := e.executeTransactionInternal(blockSpan, database, request, 0)
-	if err != nil {
-		snapshotTime := logical.Time(0)
-		if txn != nil {
-			snapshotTime = txn.SnapshotTime()
-		}
-
-		return nil, fmt.Errorf(
-			"failed to execute %s transaction %v (%d@%d) for block %s at height %v: %w",
-			"system",
-			request.txnIdStr,
-			request.txnIndex,
-			snapshotTime,
-			request.blockIdStr,
-			request.ctx.BlockHeader.Height,
-			err)
-	}
-
-	if txn.Output().Err != nil {
-		return nil, fmt.Errorf(
-			"process callback transaction %s error: %v",
-			request.txnIdStr,
-			txn.Output().Err)
-	}
-
-	return blueprints.ExecuteCallbacksTransactions(e.vmCtx.Chain, txn.Output().Events)
 }
