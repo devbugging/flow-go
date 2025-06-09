@@ -273,12 +273,19 @@ func (e *blockComputer) queueSystemTransaction(
 	systemCtx fvm.Context,
 	systemCollectionInfo collectionInfo,
 	systemTxn *flow.TransactionBody,
+	processTxn *flow.TransactionBody,
 	executeCallbackTxs []*flow.TransactionBody,
 	requestQueue chan TransactionRequest,
 	txnIndex uint32,
 	systemLogger zerolog.Logger,
 ) {
-	allTxs := append(executeCallbackTxs, systemTxn)
+	var allTxs []*flow.TransactionBody
+	if processTxn != nil {
+		allTxs = append(allTxs, processTxn)
+		allTxs = append(allTxs, executeCallbackTxs...)
+	}
+	allTxs = append(allTxs, systemTxn)
+
 	systemCollectionInfo.CompleteCollection.Transactions = allTxs
 	systemLogger = systemLogger.With().Uint32("num_txs", uint32(len(allTxs))).Logger()
 
@@ -456,6 +463,12 @@ func (e *blockComputer) executeSystemTransactions(
 	userCollectionCount := len(rawCollections)
 	txIndex := uint32(userTxCount)
 
+	var (
+		callbackTxs []*flow.TransactionBody
+		processTxn  *flow.TransactionBody
+		err         error
+	)
+
 	systemCtx := fvm.NewContextFromParent(
 		e.systemChunkCtx,
 		fvm.WithBlockHeader(block.Block.Header),
@@ -481,13 +494,13 @@ func (e *blockComputer) executeSystemTransactions(
 		isSystemTransaction: true,
 	}
 
-	var callbackTxs []*flow.TransactionBody
-	var err error
-
 	if e.vmCtx.ScheduleCallbacksEnabled {
+		processTxn = blueprints.ProcessCallbacksTransaction(e.vmCtx.Chain)
+
 		callbackTxs, err = e.executeProcessCallback(
 			systemCtx,
 			systemCollectionInfo,
+			processTxn,
 			database,
 			blockSpan,
 			txIndex,
@@ -507,6 +520,7 @@ func (e *blockComputer) executeSystemTransactions(
 		systemCtx,
 		systemCollectionInfo,
 		e.systemTxn,
+		processTxn,
 		callbackTxs,
 		txQueue,
 		txIndex,
@@ -547,12 +561,13 @@ func (e *blockComputer) executeQueue(
 func (e *blockComputer) executeProcessCallback(
 	systemCtx fvm.Context,
 	systemCollectionInfo collectionInfo,
+	processTxn *flow.TransactionBody,
 	database *transactionCoordinator,
 	blockSpan otelTrace.Span,
 	txnIndex uint32,
 	systemLogger zerolog.Logger,
 ) ([]*flow.TransactionBody, error) {
-	processTxn := blueprints.ProcessCallbacksTransaction(e.vmCtx.Chain)
+	systemCollectionInfo.CompleteCollection.Transactions = []*flow.TransactionBody{processTxn}
 
 	request := newTransactionRequest(
 		systemCollectionInfo,
