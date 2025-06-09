@@ -612,10 +612,7 @@ func (e *blockComputer) executeProcessCallback(
 	blockSpan otelTrace.Span,
 	systemLogger zerolog.Logger,
 ) (flow.EventsList, error) {
-	processTxn, err := blueprints.ProcessCallbacksTransaction(e.vmCtx.Chain)
-	if err != nil {
-		return nil, fmt.Errorf("could not get process callback transaction: %w", err)
-	}
+	processTxn := blueprints.ProcessCallbacksTransaction(e.vmCtx.Chain)
 
 	txCount := uint32(len(requestQueue)) // todo not correct
 
