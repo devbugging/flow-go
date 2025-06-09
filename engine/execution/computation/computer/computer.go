@@ -369,7 +369,7 @@ func (e *blockComputer) executeBlock(
 		e.receiptHasher,
 		parentBlockExecutionResultID,
 		block,
-		userTxCount,
+		e.maxConcurrency*2, // we add some buffer just in case result collection becomes slower than the execution
 		e.colResCons,
 		baseSnapshot,
 		versionedChunkConstructor,
