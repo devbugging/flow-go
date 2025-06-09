@@ -23,7 +23,7 @@ var processCallbacksTransaction string
 var executeCallbacksTransaction string
 
 const (
-	placeholderScheduledContract     = "\"CallbackScheduler\""
+	placeholderScheduledContract     = "import \"CallbackScheduler\""
 	processedCallbackIDFieldName     = "ID"
 	processedCallbackEffortFieldName = "executionEffort"
 	processedEventTypeTemplate       = "A.%v.CallbackScheduler.CallbackProcessed"
@@ -118,7 +118,7 @@ func prepareScheduledContractTransaction(_ flow.Chain, txScript string) []byte {
 	code := strings.ReplaceAll(
 		txScript,
 		placeholderScheduledContract,
-		scheduledContractAddress,
+		fmt.Sprintf("%s from %s", placeholderScheduledContract, scheduledContractAddress),
 	)
 
 	return []byte(code)
