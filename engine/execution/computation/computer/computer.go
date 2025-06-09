@@ -212,7 +212,7 @@ func (e *blockComputer) queueUserTransactions(
 	blockHeader *flow.Header,
 	rawCollections []*entity.CompleteCollection,
 	requestQueue chan TransactionRequest,
-) {
+) uint32 {
 	txnIndex := uint32(0)
 	blockIdStr := blockId.String()
 
@@ -250,6 +250,8 @@ func (e *blockComputer) queueUserTransactions(
 			txnIndex += 1
 		}
 	}
+
+	return txnIndex
 }
 
 func (e *blockComputer) queueSystemTransaction(
@@ -258,6 +260,7 @@ func (e *blockComputer) queueSystemTransaction(
 	processCallbackEvents flow.EventsList,
 	requestQueue chan TransactionRequest,
 	systemLogger zerolog.Logger,
+	txnIndex uint32,
 ) error {
 	systemTxn, err := blueprints.SystemChunkTransaction(e.vmCtx.Chain)
 	if err != nil {
@@ -271,8 +274,7 @@ func (e *blockComputer) queueSystemTransaction(
 
 	allTxs := append(executeCallbackTxs, systemTxn)
 	systemCollectionInfo.CompleteCollection.Transactions = allTxs
-	txCount := uint32(len(requestQueue) + len(allTxs))
-	systemLogger = systemLogger.With().Uint32("num_txs", txCount).Logger()
+	systemLogger = systemLogger.With().Uint32("num_txs", uint32(len(allTxs))).Logger()
 
 	for i, txBody := range allTxs {
 		last := i == len(allTxs)-1
@@ -281,10 +283,12 @@ func (e *blockComputer) queueSystemTransaction(
 			systemCollectionInfo,
 			systemCtx,
 			systemLogger,
-			txCount,
+			txnIndex,
 			txBody,
 			last,
 		)
+
+		txnIndex++
 	}
 
 	return nil
@@ -396,7 +400,7 @@ func (e *blockComputer) executeBlock(
 		derivedBlockData,
 		collector)
 
-	e.queueUserTransactions(
+	nextTxnIndex := e.queueUserTransactions(
 		blockId,
 		block.Block.Header,
 		rawCollections,
@@ -406,13 +410,13 @@ func (e *blockComputer) executeBlock(
 	var processEvents flow.EventsList
 
 	if e.vmCtx.ScheduleCallbacksEnabled {
-		processEvents, err = e.executeProcessCallback(
+		processEvents, nextTxnIndex, err = e.executeProcessCallback(
 			systemCtx,
 			systemCollectionInfo,
 			database,
-			requestQueue,
 			blockSpan,
 			systemLogger,
+			nextTxnIndex,
 		)
 		if err != nil {
 			return nil, err
@@ -425,6 +429,7 @@ func (e *blockComputer) executeBlock(
 		processEvents,
 		requestQueue,
 		systemLogger,
+		nextTxnIndex,
 	)
 	if err != nil {
 		return nil, err
@@ -611,19 +616,17 @@ func (e *blockComputer) executeProcessCallback(
 	systemCtx fvm.Context,
 	systemCollectionInfo collectionInfo,
 	database *transactionCoordinator,
-	requestQueue chan TransactionRequest,
 	blockSpan otelTrace.Span,
 	systemLogger zerolog.Logger,
-) (flow.EventsList, error) {
+	txnIndex uint32,
+) (flow.EventsList, uint32, error) {
 	processTxn := blueprints.ProcessCallbacksTransaction(e.vmCtx.Chain)
-
-	txCount := uint32(len(requestQueue)) // todo not correct
 
 	request := newTransactionRequest(
 		systemCollectionInfo,
 		systemCtx,
 		systemLogger,
-		txCount,
+		txnIndex,
 		processTxn,
 		true)
 
@@ -634,7 +637,7 @@ func (e *blockComputer) executeProcessCallback(
 			snapshotTime = txn.SnapshotTime()
 		}
 
-		return nil, fmt.Errorf(
+		return nil, 0, fmt.Errorf(
 			"failed to execute %s transaction %v (%d@%d) for block %s at height %v: %w",
 			"system",
 			request.txnIdStr,
@@ -645,13 +648,12 @@ func (e *blockComputer) executeProcessCallback(
 			err)
 	}
 
-	// todo handle error
 	if txn.Output().Err != nil {
-		return nil, fmt.Errorf(
+		return nil, 0, fmt.Errorf(
 			"process callback transaction %s error: %v",
 			request.txnIdStr,
-			err)
+			txn.Output().Err)
 	}
 
-	return txn.Output().Events, nil
+	return txn.Output().Events, txnIndex + 1, nil
 }
