@@ -255,6 +255,7 @@ func (e *blockComputer) queueUserTransactions(
 func (e *blockComputer) queueSystemTransaction(
 	systemCtx fvm.Context,
 	systemCollectionInfo collectionInfo,
+	processCallbackEvents flow.EventsList,
 	requestQueue chan TransactionRequest,
 	systemLogger zerolog.Logger,
 ) error {
