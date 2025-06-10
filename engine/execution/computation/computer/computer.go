@@ -207,6 +207,15 @@ func (e *blockComputer) ExecuteBlock(
 	return results, nil
 }
 
+func (e *blockComputer) userTransactionsCount(collections []*entity.CompleteCollection) int {
+	count := 0
+	for _, collection := range collections {
+		count += len(collection.Transactions)
+	}
+
+	return count
+}
+
 func (e *blockComputer) queueUserTransactions(
 	blockId flow.Identifier,
 	blockHeader *flow.Header,
@@ -257,13 +266,13 @@ func (e *blockComputer) queueSystemTransaction(
 	blockHeader *flow.Header,
 	rawCollections []*entity.CompleteCollection,
 	requestQueue chan TransactionRequest,
+	txnIndex int,
 ) error {
 	systemTxn, err := blueprints.SystemChunkTransaction(e.vmCtx.Chain)
 	if err != nil {
 		return fmt.Errorf("could not get system chunk transaction: %w", err)
 	}
 
-	txCount := uint32(len(requestQueue))
 	blockIDStr := blockId.String()
 
 	systemCtx := fvm.NewContextFromParent(
@@ -278,7 +287,7 @@ func (e *blockComputer) queueSystemTransaction(
 		Bool("system_chunk", true).
 		Bool("system_transaction", true).
 		Int("num_collections", len(rawCollections)).
-		Uint32("num_txs", txCount+1). // +1 system tx bellow
+		Int("num_txs", txnIndex+1). // +1 system tx bellow
 		Logger()
 
 	systemCollectionInfo := collectionInfo{
@@ -296,7 +305,7 @@ func (e *blockComputer) queueSystemTransaction(
 		systemCollectionInfo,
 		systemCtx,
 		systemCollectionLogger,
-		txCount,
+		uint32(txnIndex),
 		systemTxn,
 		true)
 
@@ -342,6 +351,7 @@ func (e *blockComputer) executeBlock(
 	blockIdStr := blockId.String()
 
 	rawCollections := block.Collections()
+	userTxCount := e.userTransactionsCount(rawCollections)
 
 	blockSpan := e.tracer.StartSpanFromParent(
 		e.tracer.BlockRootSpan(blockId),
@@ -376,7 +386,7 @@ func (e *blockComputer) executeBlock(
 	)
 	defer collector.Stop()
 
-	requestQueue := make(chan TransactionRequest)
+	requestQueue := make(chan TransactionRequest, userTxCount+1) // +1 for the system transaction
 
 	database := newTransactionCoordinator(
 		e.vm,
@@ -396,11 +406,13 @@ func (e *blockComputer) executeBlock(
 		block.Block.Header,
 		rawCollections,
 		requestQueue,
+		userTxCount,
 	)
-	close(requestQueue)
 	if err != nil {
 		return nil, err
 	}
+
+	close(requestQueue)
 
 	wg := &sync.WaitGroup{}
 	wg.Add(e.maxConcurrency)
